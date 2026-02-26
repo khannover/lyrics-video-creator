@@ -43,9 +43,16 @@
             overflow: hidden;
         }
         
-        #renderCanvas { 
+        #renderCanvas, #lyricCanvas, #compositeCanvas { 
+            position: absolute;
+            top: 0;
+            left: 0;
             width: 100%; 
             height: 100%; 
+        }
+        
+        #compositeCanvas {
+            display: none; /* Hidden canvas for compositing */
         }
         
         label { 
@@ -105,19 +112,6 @@
             color: var(--green); 
             font-weight: bold; 
         }
-        
-        .glitch-lyrics {
-            font-family: 'Rubik Glitch', cursive;
-            font-size: 48px;
-            color: #fff;
-            text-transform: uppercase;
-            text-align: center;
-            text-shadow: 
-                0 0 10px rgba(51,255,0,0.8),
-                0 0 20px rgba(51,255,0,0.5),
-                2px 2px 3px rgba(255,0,255,0.4),
-                -2px -2px 3px rgba(0,255,255,0.4);
-        }
     </style>
 </head>
 <body>
@@ -169,6 +163,8 @@
         <div class="panel">
             <div class="preview-wrap">
                 <canvas id="renderCanvas" width="1280" height="720"></canvas>
+                <canvas id="lyricCanvas" width="1280" height="720"></canvas>
+                <canvas id="compositeCanvas" width="1280" height="720"></canvas>
             </div>
             <p>// OUTPUT: 720p_HD // THREEJS // NATIVE_FFMPEG</p>
         </div>
@@ -177,7 +173,9 @@
     <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
     <script>
         const logEl = document.getElementById('log');
-        const canvas = document.getElementById('renderCanvas');
+        const renderCanvas = document.getElementById('renderCanvas');
+        const lyricCanvas = document.getElementById('lyricCanvas');
+        const compositeCanvas = document.getElementById('compositeCanvas');
         let lrcEntries = [];
         let scene, camera, renderer;
         let currentVisualizer = null;
@@ -189,7 +187,7 @@
             camera.position.z = 5;
             
             renderer = new THREE.WebGLRenderer({ 
-                canvas: canvas,
+                canvas: renderCanvas,
                 antialias: true,
                 alpha: false
             });
@@ -259,7 +257,7 @@
             return { map, duration };
         }
 
-        // ========== THREE.JS VISUALIZERS ==========
+        // ========== THREE.JS VISUALIZERS (ALL 12) ==========
         
         class Particles3DVisualizer {
             constructor() {
@@ -344,6 +342,7 @@
             
             destroy() {
                 this.bars.forEach(bar => scene.remove(bar));
+                camera.position.z = 5; // Reset camera
             }
         }
         
@@ -359,7 +358,6 @@
                 this.sphere = new THREE.Mesh(geometry, material);
                 scene.add(this.sphere);
                 
-                // Add glow
                 const glowGeometry = new THREE.IcosahedronGeometry(2.2, 3);
                 const glowMaterial = new THREE.MeshBasicMaterial({
                     color: 0x00ffff,
@@ -469,6 +467,7 @@
             
             destroy() {
                 scene.remove(this.galaxy);
+                camera.position.z = 5; // Reset camera
             }
         }
         
@@ -512,6 +511,7 @@
             
             destroy() {
                 this.cubes.forEach(cube => scene.remove(cube.mesh));
+                camera.rotation.y = 0; // Reset camera
             }
         }
         
@@ -766,6 +766,7 @@
             
             destroy() {
                 scene.remove(this.nebula);
+                camera.position.z = 5; // Reset camera
             }
         }
 
@@ -784,44 +785,51 @@
             nebula: NebulaCloudVisualizer
         };
 
-        // Render frame to canvas with Three.js + lyrics overlay
+        // Render frame with Three.js + lyrics overlay, return composite
         function renderFrame(audioData, currentTime, frame) {
             // Update visualizer
             if (currentVisualizer) {
                 currentVisualizer.update(audioData, frame);
             }
             
-            // Render Three.js scene
+            // Render Three.js scene to renderCanvas
             renderer.render(scene, camera);
             
-            // Get canvas context for lyrics overlay
-            const ctx = canvas.getContext('2d');
+            // Clear lyric canvas
+            const lyricCtx = lyricCanvas.getContext('2d');
+            lyricCtx.clearRect(0, 0, 1280, 720);
             
-            // Draw lyrics on top
+            // Draw lyrics on lyricCanvas
             const activeLrc = lrcEntries.filter(e => e.time <= currentTime).pop();
-            if (activeLrc) {
-                ctx.save();
-                ctx.font = "bold 48px 'Rubik Glitch', 'Courier New', monospace";
-                ctx.fillStyle = "#ffffff";
-                ctx.textAlign = "center";
-                ctx.textBaseline = "middle";
+            if (activeLrc && activeLrc.text) {
+                lyricCtx.save();
+                lyricCtx.font = "bold 48px 'Rubik Glitch', 'Courier New', monospace";
+                lyricCtx.fillStyle = "#ffffff";
+                lyricCtx.textAlign = "center";
+                lyricCtx.textBaseline = "middle";
                 
                 // Glitch shadow effect
-                ctx.shadowBlur = 15;
-                ctx.shadowColor = "#00ff00";
-                ctx.shadowOffsetX = 2;
-                ctx.shadowOffsetY = 2;
+                lyricCtx.shadowBlur = 15;
+                lyricCtx.shadowColor = "#00ff00";
+                lyricCtx.shadowOffsetX = 2;
+                lyricCtx.shadowOffsetY = 2;
                 
                 // Stroke for better visibility
-                ctx.lineWidth = 3;
-                ctx.strokeStyle = "#000000";
-                ctx.strokeText(activeLrc.text.toUpperCase(), 640, 650);
+                lyricCtx.lineWidth = 3;
+                lyricCtx.strokeStyle = "#000000";
+                lyricCtx.strokeText(activeLrc.text.toUpperCase(), 640, 650);
                 
                 // Fill text
-                ctx.fillText(activeLrc.text.toUpperCase(), 640, 650);
+                lyricCtx.fillText(activeLrc.text.toUpperCase(), 640, 650);
                 
-                ctx.restore();
+                lyricCtx.restore();
             }
+            
+            // Composite both canvases to compositeCanvas for blob export
+            const compCtx = compositeCanvas.getContext('2d');
+            compCtx.clearRect(0, 0, 1280, 720);
+            compCtx.drawImage(renderCanvas, 0, 0);
+            compCtx.drawImage(lyricCanvas, 0, 0);
         }
 
         // Main render button handler
@@ -895,8 +903,8 @@
                     // Render frame with Three.js + lyrics
                     renderFrame(audioData, currentTime, i);
 
-                    // Convert canvas to blob
-                    const frameBlob = await new Promise(r => canvas.toBlob(r, 'image/webp', 0.75));
+                    // Convert COMPOSITE canvas to blob
+                    const frameBlob = await new Promise(r => compositeCanvas.toBlob(r, 'image/webp', 0.75));
                     batch.push({ index: i, blob: frameBlob });
 
                     // Upload batch with concurrency control
