@@ -1,15 +1,16 @@
 FROM python:3.11-slim
 
-# Install native ffmpeg
+# Install native ffmpeg and curl for healthcheck
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg curl && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-RUN pip install --no-cache-dir fastapi uvicorn python-multipart
-
 WORKDIR /app
+
+# Copy and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY server.py .
