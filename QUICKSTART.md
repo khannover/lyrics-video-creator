@@ -67,10 +67,11 @@ LRC format is simple:
 ## Pro Tips 🚀
 
 1. **Start with 30 FPS** - Balanced speed and quality
-2. **Use WebP format** - Smaller file sizes, faster uploads
-3. **Batch size 60** - Good default for most systems
+2. **JPEG encoding** - Frames are encoded as JPEG (default) for faster rendering
+3. **Batch size 60** - Good default; try 120 for fast network connections
 4. **Test short clips first** - Render 30 seconds before full song
 5. **Modern browser** - Chrome/Edge work best
+6. **Monitor queue** - Check `GET /api/health` or `GET /api/queue` to see FFmpeg status
 
 ## Troubleshooting 🐛
 

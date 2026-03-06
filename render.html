@@ -785,8 +785,31 @@
             nebula: NebulaCloudVisualizer
         };
 
+        // Wrap text into multiple lines that fit within maxWidth.
+        function wrapText(ctx, text, maxWidth) {
+            const words = text.split(' ');
+            const lines = [];
+            let current = '';
+            for (const word of words) {
+                const test = current ? `${current} ${word}` : word;
+                if (ctx.measureText(test).width > maxWidth && current) {
+                    lines.push(current);
+                    current = word;
+                } else {
+                    current = test;
+                }
+            }
+            if (current) lines.push(current);
+            return lines;
+        }
+
         // Render frame with Three.js + lyrics overlay, return composite
         function renderFrame(audioData, currentTime, frame) {
+            const FADE_DURATION = 0.25; // seconds for fade-in / fade-out
+            const LYRIC_SAFE_WIDTH = 1180; // max text width (50 px margin each side)
+            const LYRIC_BASELINE_Y = 635;  // base Y for bottom lyric line
+            const LINE_HEIGHT = 58;        // vertical spacing between wrapped lines
+
             // Update visualizer
             if (currentVisualizer) {
                 currentVisualizer.update(audioData, frame);
@@ -799,29 +822,63 @@
             const lyricCtx = lyricCanvas.getContext('2d');
             lyricCtx.clearRect(0, 0, 1280, 720);
             
-            // Draw lyrics on lyricCanvas
-            const activeLrc = lrcEntries.filter(e => e.time <= currentTime).pop();
+            // Determine active lyric and next lyric for fade calculation
+            const activeIdx = lrcEntries.reduce((best, e, i) => e.time <= currentTime ? i : best, -1);
+            const activeLrc = activeIdx >= 0 ? lrcEntries[activeIdx] : null;
+            const nextLrc   = activeIdx >= 0 && activeIdx + 1 < lrcEntries.length
+                              ? lrcEntries[activeIdx + 1] : null;
+
             if (activeLrc && activeLrc.text) {
+                // Compute fade alpha
+                const elapsed   = currentTime - activeLrc.time;
+                const remaining = nextLrc ? nextLrc.time - currentTime : Infinity;
+                let alpha = 1.0;
+                if (elapsed < FADE_DURATION) {
+                    alpha = elapsed / FADE_DURATION;
+                } else if (remaining < FADE_DURATION && remaining >= 0) {
+                    alpha = remaining / FADE_DURATION;
+                }
+
                 lyricCtx.save();
+                lyricCtx.globalAlpha = Math.max(0, Math.min(1, alpha));
                 lyricCtx.font = "bold 48px 'Rubik Glitch', 'Courier New', monospace";
-                lyricCtx.fillStyle = "#ffffff";
                 lyricCtx.textAlign = "center";
-                lyricCtx.textBaseline = "middle";
-                
-                // Glitch shadow effect
-                lyricCtx.shadowBlur = 15;
-                lyricCtx.shadowColor = "#00ff00";
-                lyricCtx.shadowOffsetX = 2;
-                lyricCtx.shadowOffsetY = 2;
-                
-                // Stroke for better visibility
-                lyricCtx.lineWidth = 3;
-                lyricCtx.strokeStyle = "#000000";
-                lyricCtx.strokeText(activeLrc.text.toUpperCase(), 640, 650);
-                
-                // Fill text
-                lyricCtx.fillText(activeLrc.text.toUpperCase(), 640, 650);
-                
+                lyricCtx.textBaseline = "alphabetic";
+
+                const upperText = activeLrc.text.toUpperCase();
+                const lines = wrapText(lyricCtx, upperText, LYRIC_SAFE_WIDTH);
+                const startY = LYRIC_BASELINE_Y - (lines.length - 1) * LINE_HEIGHT;
+
+                lines.forEach((line, lineIdx) => {
+                    const y = startY + lineIdx * LINE_HEIGHT;
+
+                    // Dark drop-shadow for depth
+                    lyricCtx.shadowColor = "rgba(0,0,0,0.85)";
+                    lyricCtx.shadowBlur = 8;
+                    lyricCtx.shadowOffsetX = 3;
+                    lyricCtx.shadowOffsetY = 3;
+
+                    // Thick black outline for contrast
+                    lyricCtx.lineWidth = 6;
+                    lyricCtx.strokeStyle = "#000000";
+                    lyricCtx.lineJoin = "round";
+                    lyricCtx.strokeText(line, 640, y);
+
+                    // Green glow layer
+                    lyricCtx.shadowColor = "#00ff00";
+                    lyricCtx.shadowBlur = 20;
+                    lyricCtx.shadowOffsetX = 0;
+                    lyricCtx.shadowOffsetY = 0;
+                    lyricCtx.lineWidth = 2;
+                    lyricCtx.strokeStyle = "#00cc00";
+                    lyricCtx.strokeText(line, 640, y);
+
+                    // White fill
+                    lyricCtx.shadowBlur = 0;
+                    lyricCtx.fillStyle = "#ffffff";
+                    lyricCtx.fillText(line, 640, y);
+                });
+
                 lyricCtx.restore();
             }
             
@@ -891,7 +948,25 @@
                 
                 const batchSize = parseInt(document.getElementById('batchSize').value);
                 const totalFrames = map.length;
-                log(`RENDERING ${totalFrames} FRAMES...`, true);
+                const renderStart = performance.now();
+                log(`RENDERING ${totalFrames} FRAMES @ ${FPS} FPS...`, true);
+
+                // Helper: upload a single frame with one automatic retry.
+                async function uploadFrame(sid, index, blob) {
+                    const makeForm = () => {
+                        const form = new FormData();
+                        form.append('frame_index', index);
+                        form.append('frame', blob, `f${String(index).padStart(6, '0')}.jpg`);
+                        return form;
+                    };
+                    let resp = await fetch(`/api/frame/${sid}`, { method: 'POST', body: makeForm() });
+                    if (!resp.ok) {
+                        // Retry once on transient errors (5xx, network hiccups).
+                        resp = await fetch(`/api/frame/${sid}`, { method: 'POST', body: makeForm() });
+                        if (!resp.ok) throw new Error(`Frame ${index} upload failed (${resp.status})`);
+                    }
+                    return resp;
+                }
 
                 // 5. Render + upload in batches
                 let batch = [];
@@ -903,31 +978,29 @@
                     // Render frame with Three.js + lyrics
                     renderFrame(audioData, currentTime, i);
 
-                    // Convert COMPOSITE canvas to blob
-                    const frameBlob = await new Promise(r => compositeCanvas.toBlob(r, 'image/webp', 0.75));
+                    // Convert COMPOSITE canvas to JPEG blob (faster encoding than WebP)
+                    const frameBlob = await new Promise(r => compositeCanvas.toBlob(r, 'image/jpeg', 0.85));
                     batch.push({ index: i, blob: frameBlob });
 
-                    // Upload batch with concurrency control
+                    // Upload batch with concurrency control (10 parallel uploads per chunk)
                     if (batch.length >= batchSize || i === totalFrames - 1) {
+                        const CHUNK = 10;
                         const chunks = [];
-                        for (let c = 0; c < batch.length; c += 5) {
-                            chunks.push(batch.slice(c, c + 5));
+                        for (let c = 0; c < batch.length; c += CHUNK) {
+                            chunks.push(batch.slice(c, c + CHUNK));
                         }
                         for (const chunk of chunks) {
-                            await Promise.all(chunk.map(({ index, blob }) => {
-                                const form = new FormData();
-                                form.append('frame_index', index);
-                                form.append('frame', blob, `f${index}.webp`);
-                                return fetch(`/api/frame/${sid}`, { method: 'POST', body: form });
-                            }));
+                            await Promise.all(chunk.map(({ index, blob }) => uploadFrame(sid, index, blob)));
                         }
                         batch = [];
                     }
 
                     if (i % 30 === 0 || i === totalFrames - 1) {
                         const pct = ((i / totalFrames) * 100).toFixed(1);
+                        const elapsed = ((performance.now() - renderStart) / 1000).toFixed(1);
+                        const fps_est = elapsed > 0 ? (i / elapsed).toFixed(1) : '…';
                         document.getElementById('progress-fill').style.width = `${pct}%`;
-                        log(`FRAMES: ${i}/${totalFrames} (${pct}%)`);
+                        log(`FRAMES: ${i}/${totalFrames} (${pct}%) | ${fps_est} fps | ${elapsed}s elapsed`);
                         await new Promise(r => setTimeout(r, 0));
                     }
                 }
