@@ -183,6 +183,30 @@ Compile all frames + audio into final MP4.
 ### GET `/api/download/{session_id}`
 Download the compiled video.
 
+### GET `/api/queue`
+Check compile job queue status.
+
+**Response:**
+```json
+{
+    "waiting": 0,
+    "running": false
+}
+```
+
+### GET `/api/health`
+Get server health and resource usage.
+
+**Response:**
+```json
+{
+    "status": "ok",
+    "disk": { "free_gb": 42.5, "used_gb": 7.2 },
+    "sessions": 3,
+    "queue": { "waiting": 0, "running": false }
+}
+```
+
 ### DELETE `/api/cleanup/{session_id}`
 Clean up session files.
 
@@ -202,6 +226,16 @@ Clean up session files.
 - Verify frame format matches (webp/jpg/png)
 - Ensure frame sequence is complete
 
+## 🚀 Performance Notes
+
+- **JPEG frames** – The renderer now encodes frames as JPEG (quality 0.85) instead of WebP, which is significantly faster to encode in most browsers.
+- **Parallel uploads** – Frame batches are now uploaded 10 at a time (up from 5), reducing total upload time.
+- **Retry on error** – Failed frame uploads are automatically retried once.
+- **Async FFmpeg** – The compile endpoint is non-blocking; the event loop is not stalled during video encoding.
+- **Compile queue** – Only one FFmpeg job runs at a time; concurrent compile requests wait in a queue rather than crashing the server.
+- **Faststart** – Output MP4 uses `-movflags +faststart` for progressive web playback.
+- **Auto cleanup** – Stale session directories (older than 30 minutes) are removed automatically every 10 minutes.
+
 ## 🎯 Performance Tips
 
 1. **Batch Size**: Use 60 for balanced performance, 120 for faster uploads (if stable)
@@ -214,7 +248,7 @@ Clean up session files.
 - **Output Resolution**: 1280x720 (720p HD)
 - **Video Codec**: H.264 (libx264, ultrafast preset)
 - **Audio Codec**: MP3 (libmp3lame, 192kbps)
-- **Frame Format**: WebP (quality 0.75) or JPG
+- **Frame Format**: JPEG (quality 0.85) – faster to encode than WebP
 - **Pixel Format**: yuv420p (maximum compatibility)
 
 ## 🤝 Contributing

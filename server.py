@@ -1,8 +1,10 @@
+import asyncio
 import os
 import re
 import shutil
-import subprocess
+import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, Form
@@ -10,7 +12,47 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-app = FastAPI(title="Bancamp Studio V4")
+RENDER_DIR = Path("renders")
+RENDER_DIR.mkdir(exist_ok=True)
+
+# Compile job queue: only one FFmpeg process at a time; others wait.
+_compile_semaphore = asyncio.Semaphore(1)
+_compile_waiting: int = 0
+_compile_running: bool = False
+
+CLEANUP_INTERVAL_SECONDS = 600   # run cleanup every 10 minutes
+SESSION_MAX_AGE_SECONDS = 1800   # delete sessions older than 30 minutes
+
+
+async def _auto_cleanup() -> None:
+    """Background task: periodically remove stale session directories."""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+        now = time.time()
+        if RENDER_DIR.exists():
+            for entry in list(RENDER_DIR.iterdir()):
+                if entry.is_dir():
+                    try:
+                        age = now - entry.stat().st_mtime
+                        if age > SESSION_MAX_AGE_SECONDS:
+                            shutil.rmtree(entry)
+                            print(f"[cleanup] removed stale session {entry.name} (age={age:.0f}s)")
+                    except Exception as exc:
+                        print(f"[cleanup] error removing {entry}: {exc}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup_task = asyncio.create_task(_auto_cleanup())
+    yield
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="Bancamp Studio V4", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,9 +60,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-RENDER_DIR = Path("renders")
-RENDER_DIR.mkdir(exist_ok=True)
 
 
 @app.post("/api/start")
@@ -73,62 +112,128 @@ async def upload_audio(session_id: str, audio: UploadFile = File(...)):
 
 @app.post("/api/compile/{session_id}")
 async def compile_video(session_id: str, fps: int = Form(default=30)):
+    global _compile_waiting, _compile_running
+
     session_dir = RENDER_DIR / session_id
-    
-    # Detect frame "format"
+
+    # Detect frame format before entering the queue so we can fail fast.
     frames = sorted((session_dir / "frames").glob("f*"))
     if not frames:
         return {"error": "No frames found"}
-    
-    ext = frames[0].suffix  # .jpg or .webp
-    frames_pattern = str(session_dir / "frames" / f"f%06d{ext}")
 
-    # Use the first frame index as start_number to avoid gaps killing ffmpeg
+    ext = frames[0].suffix  # .jpg, .webp, .png …
     match = re.search(r"f(\d+)", frames[0].name)
     start_number = int(match.group(1)) if match else 0
 
-    audio_path = str(session_dir / "audio.mp3")
-    output_path = str(session_dir / "output.mp4")
-
-    # FIX: Correctly support both webp and jpg
-    # The glob pattern f%06d expects exactly 6 digits (e.g., f000000.webp)
-    # But if files are named f0.webp, f1.webp ..., we need f%d instead.
-    # Check the first file to see if it has leading zeros.
+    # Support both zero-padded (f000000.jpg) and non-padded (f0.jpg) filenames.
     has_leading_zeros = frames[0].name.startswith("f00")
     frame_fmt = "%06d" if has_leading_zeros else "%d"
     frames_pattern = str(session_dir / "frames" / f"f{frame_fmt}{ext}")
 
+    audio_path = str(session_dir / "audio.mp3")
+    output_path = str(session_dir / "output.mp4")
+
     print(f"Compiling: {frames_pattern} (start: {start_number}, fps: {fps})")
 
-    # Remove -shortest as it can cause empty output if audio stream is problematic or shorter than 1 frame
-    # Instead, we rely on the frame input to determine length.
-    cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-start_number", str(start_number), "-i", frames_pattern]
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(fps),
+        "-start_number", str(start_number),
+        "-i", frames_pattern,
+    ]
     if os.path.exists(audio_path):
         audio_size = os.path.getsize(audio_path)
         print(f"Adding audio track: {audio_path} ({audio_size} bytes)")
-        
-        # We use -map 0:v so it definitely takes the video from the image sequence (input 0)
-        # We use -map 1:a so it definitely takes the audio from the file (input 1)
-        # We use libmp3lame which is definitely enabled in this build
-        cmd.extend(["-i", audio_path, "-map", "0:v", "-map", "1:a", "-c:a", "libmp3lame", "-b:a", "192k", "-shortest"])
-    
-    # Add pixel format and ensure compatibility
-    cmd.extend(["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", output_path])
+        cmd.extend([
+            "-i", audio_path,
+            "-map", "0:v",
+            "-map", "1:a",
+            "-c:a", "libmp3lame",
+            "-b:a", "192k",
+            "-shortest",
+        ])
+
+    # H.264, ultrafast, web-optimised faststart for progressive download.
+    cmd.extend([
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ])
 
     print("Running FFmpeg:", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print("FFmpeg Error:", result.stderr)
-        return {"error": result.stderr[-500:]}
-        
-    print("FFmpeg Output:", result.stdout)
-    if os.path.getsize(output_path) < 1000:
-        print("Warning: Output file is very small!")
-        # Force return failure if file is practically empty
+
+    # Enqueue – only one FFmpeg job at a time, others wait.
+    _compile_waiting += 1
+    try:
+        await _compile_semaphore.acquire()
+    except BaseException:
+        # Cancelled or other error while waiting for the semaphore.
+        _compile_waiting -= 1
+        raise
+    # We hold the semaphore from here; decrement waiting and mark running.
+    _compile_waiting -= 1
+    _compile_running = True
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await proc.communicate()
+        stderr_text = stderr_bytes.decode(errors="replace")
+        stdout_text = stdout_bytes.decode(errors="replace")
+    finally:
+        _compile_running = False
+        _compile_semaphore.release()
+
+    if proc.returncode != 0:
+        print("FFmpeg Error (full):\n", stderr_text)
+        return {"error": stderr_text[-500:]}
+
+    print("FFmpeg stdout:", stdout_text)
+    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1000:
+        print("Warning: Output file is missing or very small!")
         return {"error": "Output file is empty or corrupted. Check logs."}
 
     return {"status": "done", "download": f"/api/download/{session_id}"}
+
+
+@app.get("/api/queue")
+async def queue_status():
+    """Return current compile queue depth and running status."""
+    return {
+        "waiting": _compile_waiting,
+        "running": _compile_running,
+    }
+
+
+@app.get("/api/health")
+async def health():
+    """Return disk usage for the renders directory and session counts."""
+    try:
+        usage = shutil.disk_usage(RENDER_DIR)
+        free_gb = round(usage.free / 1e9, 2)
+        used_gb = round(usage.used / 1e9, 2)
+    except Exception:
+        free_gb = used_gb = -1
+
+    session_count = len([d for d in RENDER_DIR.iterdir() if d.is_dir()]) if RENDER_DIR.exists() else 0
+
+    return {
+        "status": "ok",
+        "disk": {
+            "free_gb": free_gb,
+            "used_gb": used_gb,
+        },
+        "sessions": session_count,
+        "queue": {
+            "waiting": _compile_waiting,
+            "running": _compile_running,
+        },
+    }
 
 
 @app.get("/api/download/{session_id}")
